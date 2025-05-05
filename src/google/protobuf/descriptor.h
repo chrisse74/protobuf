@@ -148,6 +148,10 @@ namespace io {
 class Printer;
 }  // namespace io
 
+namespace internal {
+class InternalFeatureHelper;
+}  // namespace internal
+
 // NB, all indices are zero-based.
 struct SourceLocation {
   int start_line;
@@ -319,41 +323,6 @@ class PROTOBUF_EXPORT SymbolBase {
 // See BuildEnumValue for details.
 template <int N>
 class PROTOBUF_EXPORT SymbolBaseN : public SymbolBase {};
-
-// This class is for internal use only and provides access to the resolved
-// runtime FeatureSets of any descriptor.  These features are not designed
-// to be stable, and depending directly on them (vs the public descriptor APIs)
-// is not safe.
-class PROTOBUF_EXPORT InternalFeatureHelper {
- public:
-  template <typename DescriptorT>
-  static const FeatureSet& GetFeatures(const DescriptorT& desc) {
-    return desc.features();
-  }
-
- private:
-  friend class ::google::protobuf::compiler::CodeGenerator;
-  friend class ::google::protobuf::compiler::CommandLineInterface;
-
-  // Provides a restricted view exclusively to code generators to query their
-  // own unresolved features.  Unresolved features are virtually meaningless to
-  // everyone else. Code generators will need them to validate their own
-  // features, and runtimes may need them internally to be able to properly
-  // represent the original proto files from generated code.
-  template <typename DescriptorT, typename TypeTraitsT, uint8_t field_type,
-            bool is_packed>
-  static typename TypeTraitsT::ConstType GetUnresolvedFeatures(
-      const DescriptorT& descriptor,
-      const google::protobuf::internal::ExtensionIdentifier<
-          FeatureSet, TypeTraitsT, field_type, is_packed>& extension) {
-    return descriptor.proto_features_->GetExtension(extension);
-  }
-
-  // Provides a restricted view exclusively to code generators to query the
-  // edition of files being processed.  While most people should never write
-  // edition-dependent code, generators frequently will need to.
-  static Edition GetEdition(const FileDescriptor& desc);
-};
 
 PROTOBUF_EXPORT absl::string_view ShortEditionName(Edition edition);
 
@@ -1951,6 +1920,15 @@ class PROTOBUF_EXPORT FileDescriptor : private internal::SymbolBase {
   // These are returned in the order they were defined in the .proto file.
   const FileDescriptor* weak_dependency(int index) const;
 
+  // The number of files that are imported for options.
+  // The option dependency list is separate from the dependency list.
+  int option_dependency_count() const;
+  // Gets name of an option imported file by index, where
+  //     0 <= index < option_dependency_count()
+  // These are returned in the relative order they were defined in the .proto
+  // file.
+  absl::string_view option_dependency_name(int index) const;
+
   // Number of top-level message types defined in this file.  (This does not
   // include nested types.)
   int message_type_count() const;
@@ -2090,6 +2068,7 @@ class PROTOBUF_EXPORT FileDescriptor : private internal::SymbolBase {
   int dependency_count_;
   int public_dependency_count_;
   int weak_dependency_count_;
+  int option_dependency_count_;
   int message_type_count_;
   int enum_type_count_;
   int service_count_;
@@ -2097,6 +2076,8 @@ class PROTOBUF_EXPORT FileDescriptor : private internal::SymbolBase {
   mutable const FileDescriptor** dependencies_;
   int* public_dependencies_;
   int* weak_dependencies_;
+  absl::string_view* option_dependencies_;
+
   Descriptor* message_types_;
   EnumDescriptor* enum_types_;
   ServiceDescriptor* services_;
@@ -2125,7 +2106,7 @@ class PROTOBUF_EXPORT FileDescriptor : private internal::SymbolBase {
   friend class ServiceDescriptor;
 };
 
-PROTOBUF_INTERNAL_CHECK_CLASS_SIZE(FileDescriptor, 168);
+PROTOBUF_INTERNAL_CHECK_CLASS_SIZE(FileDescriptor, 184);
 
 #ifndef SWIG
 enum class ExtDeclEnforcementLevel : uint8_t {
@@ -2310,11 +2291,11 @@ class PROTOBUF_EXPORT DescriptorPool {
     // descriptor - Descriptor of the erroneous element.
     // location - One of the location constants, above.
     // message - Human-readable error message.
-    virtual void RecordWarning(absl::string_view filename,
-                               absl::string_view element_name,
-                               const Message* descriptor,
-                               ErrorLocation location,
-                               absl::string_view message) {
+    virtual void RecordWarning([[maybe_unused]] absl::string_view filename,
+                               [[maybe_unused]] absl::string_view element_name,
+                               [[maybe_unused]] const Message* descriptor,
+                               [[maybe_unused]] ErrorLocation location,
+                               [[maybe_unused]] absl::string_view message) {
     }
 
   };
@@ -2361,6 +2342,11 @@ class PROTOBUF_EXPORT DescriptorPool {
   // In Edition 2024+, the 'enforce_naming_style` feature can be used to opt out
   // of this enforcement.
   void EnforceNamingStyle(bool enforce) { enforce_naming_style_ = enforce; }
+
+  // By default, option imports are allowed to be missing.
+  // If you call EnforceOptionDependencies(true), however, the DescriptorPool
+  // will report a import not found error.
+  void EnforceOptionDependencies(bool enforce) { enforce_option_ = enforce; }
 
   // Sets the default feature mappings used during the build. If this function
   // isn't called, the C++ feature set defaults are used.  If this function is
@@ -2661,6 +2647,7 @@ class PROTOBUF_EXPORT DescriptorPool {
   bool lazily_build_dependencies_;
   bool allow_unknown_;
   bool enforce_weak_;
+  bool enforce_option_ = false;
   ExtDeclEnforcementLevel enforce_extension_declarations_;
   bool disallow_enforce_utf8_;
   bool deprecated_legacy_json_field_conflicts_;
@@ -2812,6 +2799,7 @@ PROTOBUF_DEFINE_ACCESSOR(FileDescriptor, pool, const DescriptorPool*)
 PROTOBUF_DEFINE_ACCESSOR(FileDescriptor, dependency_count, int)
 PROTOBUF_DEFINE_ACCESSOR(FileDescriptor, public_dependency_count, int)
 PROTOBUF_DEFINE_ACCESSOR(FileDescriptor, weak_dependency_count, int)
+PROTOBUF_DEFINE_ACCESSOR(FileDescriptor, option_dependency_count, int)
 PROTOBUF_DEFINE_ACCESSOR(FileDescriptor, message_type_count, int)
 PROTOBUF_DEFINE_ACCESSOR(FileDescriptor, enum_type_count, int)
 PROTOBUF_DEFINE_ACCESSOR(FileDescriptor, service_count, int)

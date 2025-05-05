@@ -822,7 +822,7 @@ std::string PrimitiveTypeName(const Options& options,
     case FieldDescriptor::CPPTYPE_ENUM:
       return "int";
     case FieldDescriptor::CPPTYPE_STRING:
-      return "std::string";
+      return "::std::string";
     case FieldDescriptor::CPPTYPE_MESSAGE:
       return "";
 
@@ -1126,6 +1126,21 @@ bool HasLazyFields(const FileDescriptor* file, const Options& options,
     }
   }
   return false;
+}
+
+bool IsMicroString(const FieldDescriptor* field, const Options& opts) {
+  return !field->is_repeated() && !field->is_extension() &&
+         field->cpp_type() == FieldDescriptor::CPPTYPE_STRING &&
+         field->cpp_string_type() == FieldDescriptor::CppStringType::kView &&
+         opts.experimental_use_micro_string &&
+         // map entry fields don't use MicroString right now
+         !field->containing_type()->options().map_entry();
+}
+
+bool IsArenaStringPtr(const FieldDescriptor* field, const Options& opts) {
+  if (IsMicroString(field, opts)) return false;
+  return field->cpp_string_type() == FieldDescriptor::CppStringType::kString ||
+         field->cpp_string_type() == FieldDescriptor::CppStringType::kView;
 }
 
 bool ShouldVerify(const Descriptor* descriptor, const Options& options,
@@ -1791,6 +1806,10 @@ void ListAllFields(const FileDescriptor* d,
   }
 }
 
+bool IsLayoutOptimized(const FieldDescriptor* field, const Options& options) {
+  return field->real_containing_oneof() == nullptr && !IsWeak(field, options);
+}
+
 int CollectFieldsExcludingWeakAndOneof(
     const Descriptor* d, const Options& options,
     std::vector<const FieldDescriptor*>& fields) {
@@ -1798,10 +1817,9 @@ int CollectFieldsExcludingWeakAndOneof(
   for (auto field : FieldRange(d)) {
     if (IsWeak(field, options)) {
       ++num_weak_fields;
-      continue;
     }
 
-    if (!field->real_containing_oneof()) {
+    if (IsLayoutOptimized(field, options)) {
       fields.push_back(field);
     }
   }

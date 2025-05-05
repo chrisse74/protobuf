@@ -291,9 +291,10 @@ bool ShouldEmitNonDefaultCheck(const FieldDescriptor* field) {
 
 void EmitNonDefaultCheckForString(io::Printer* p, absl::string_view prefix,
                                   const FieldDescriptor* field, bool split,
+                                  const Options& opts,
                                   absl::AnyInvocable<void()> emit_body) {
   ABSL_DCHECK(field->cpp_type() == FieldDescriptor::CPPTYPE_STRING);
-  ABSL_DCHECK(IsArenaStringPtr(field));
+  ABSL_DCHECK(IsArenaStringPtr(field, opts));
   p->Emit(
       {
           {"condition", [&] { EmitNonDefaultCheck(p, prefix, field); }},
@@ -388,17 +389,18 @@ void MayEmitIfNonDefaultCheck(io::Printer* p, absl::string_view prefix,
 
 void MayEmitMutableIfNonDefaultCheck(io::Printer* p, absl::string_view prefix,
                                      const FieldDescriptor* field, bool split,
+                                     const Options& opts,
                                      absl::AnyInvocable<void()> emit_body,
                                      bool with_enclosing_braces_always) {
   if (ShouldEmitNonDefaultCheck(field)) {
     if (field->cpp_type() == FieldDescriptor::CPPTYPE_STRING &&
-        IsArenaStringPtr(field)) {
+        IsArenaStringPtr(field, opts)) {
       // If a field is backed by std::string, when default initialized it will
       // point to a global empty std::string instance. We prefer to spend some
       // extra cycles here to create a local string instance in the else branch,
       // so that we can get rid of a branch when Clear() is called (if we do
       // this, Clear() can always assume string instance is nonglobal).
-      EmitNonDefaultCheckForString(p, prefix, field, split,
+      EmitNonDefaultCheckForString(p, prefix, field, split, opts,
                                    std::move(emit_body));
       return;
     }
@@ -633,9 +635,16 @@ MessageGenerator::MessageGenerator(
   num_weak_fields_ = CollectFieldsExcludingWeakAndOneof(descriptor_, options_,
                                                         optimized_order_);
   const size_t initial_size = optimized_order_.size();
-  message_layout_helper_->OptimizeLayout(optimized_order_, options_,
-                                         scc_analyzer_);
+  optimized_order_ = message_layout_helper_->OptimizeLayout(
+      optimized_order_, options_, scc_analyzer_);
   ABSL_CHECK_EQ(initial_size, optimized_order_.size());
+  // Verify that all split fields are placed at the end in the optimized order.
+  ABSL_CHECK(std::is_sorted(
+      optimized_order_.begin(), optimized_order_.end(),
+      [this](const FieldDescriptor* a, const FieldDescriptor* b) {
+        return static_cast<int>(ShouldSplit(a, options_)) <
+               static_cast<int>(ShouldSplit(b, options_));
+      }));
 
   // This message has hasbits iff one or more fields need one.
   for (auto field : optimized_order_) {
@@ -1506,9 +1515,10 @@ void MessageGenerator::GenerateMapEntryClassDefinition(io::Printer* p) {
 }
 
 void MessageGenerator::GenerateImplDefinition(io::Printer* p) {
+  if (HasSimpleBaseClass(descriptor_, options_)) return;
   // Prepare decls for _cached_size_ and _has_bits_.  Their position in the
   // output will be determined later.
-  bool need_to_emit_cached_size = !HasSimpleBaseClass(descriptor_, options_);
+  bool need_to_emit_cached_size = true;
   const size_t sizeof_has_bits = HasBitsSize();
 
   // To minimize padding, data members are divided into three sections:
@@ -2168,7 +2178,7 @@ void MessageGenerator::GenerateClassDefinition(io::Printer* p) {
 #if defined(PROTOBUF_CUSTOM_VTABLE)
           //~ Define a derived `operator delete` to avoid dynamic dispatch when
           //~ the type is statically known
-          void operator delete($classname$* $nonnull$ msg, std::destroying_delete_t) {
+          void operator delete($classname$* $nonnull$ msg, ::std::destroying_delete_t) {
             SharedDtor(*msg);
             $pbi$::SizedDelete(msg, sizeof($classname$));
           }
@@ -2680,6 +2690,8 @@ size_t MessageGenerator::GenerateOffsets(io::Printer* p) {
       format(" | ::_pbi::kLazyMask");
     } else if (IsStringInlined(field, options_)) {
       format(" | ::_pbi::kInlinedMask");
+    } else if (IsMicroString(field, options_)) {
+      format(" | ::_pbi::kMicroStringMask");
     }
     format(",\n");
   }
@@ -2929,8 +2941,8 @@ void MessageGenerator::GenerateSharedConstructorCode(io::Printer* p) {
            {"zero_init", [&] { GenerateZeroInitFields(p); }}},
           R"cc(
             PROTOBUF_NDEBUG_INLINE $classname$::Impl_::Impl_(
-                $pbi$::InternalVisibility visibility,
-                $pb$::Arena* $nullable$ arena)
+                [[maybe_unused]] $pbi$::InternalVisibility visibility,
+                [[maybe_unused]] $pb$::Arena* $nullable$ arena)
                 //~
                 $init_impl$ {}
 
@@ -3338,9 +3350,9 @@ void MessageGenerator::GenerateArenaEnabledCopyConstructor(io::Printer* p) {
         {{"init", [&] { GenerateImplMemberInit(p, InitType::kArenaCopy); }}},
         R"cc(
           PROTOBUF_NDEBUG_INLINE $classname$::Impl_::Impl_(
-              $pbi$::InternalVisibility visibility,
-              $pb$::Arena* $nullable$ arena, const Impl_& from,
-              const $classtype$& from_msg)
+              [[maybe_unused]] $pbi$::InternalVisibility visibility,
+              [[maybe_unused]] $pb$::Arena* $nullable$ arena, const Impl_& from,
+              [[maybe_unused]] const $classtype$& from_msg)
               //~
               $init$ {}
         )cc");
@@ -4348,7 +4360,7 @@ void MessageGenerator::GenerateClassSpecificMergeImpl(io::Printer* p) {
           // Merge semantics without true field presence: primitive fields are
           // merged only if non-zero (numeric) or non-empty (string).
           MayEmitMutableIfNonDefaultCheck(
-              p, "from.", field, ShouldSplit(field, options_),
+              p, "from.", field, ShouldSplit(field, options_), options_,
               /*emit_body=*/[&]() { generator.GenerateMergingCode(p); },
               /*with_enclosing_braces_always=*/true);
         } else if (field->options().weak() ||
@@ -4374,7 +4386,7 @@ void MessageGenerator::GenerateClassSpecificMergeImpl(io::Printer* p) {
             // Merge semantics without true field presence: primitive fields are
             // merged only if non-zero (numeric) or non-empty (string).
             MayEmitMutableIfNonDefaultCheck(
-                p, "from.", field, ShouldSplit(field, options_),
+                p, "from.", field, ShouldSplit(field, options_), options_,
                 /*emit_body=*/[&]() { generator.GenerateMergingCode(p); },
                 /*with_enclosing_braces_always=*/false);
           } else {
